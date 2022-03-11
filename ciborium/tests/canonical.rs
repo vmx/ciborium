@@ -41,26 +41,26 @@ fn rfc8949_example() {
     assert_eq!(array, golden);
 }
 
-#[test]
-fn map() {
-    let mut map = BTreeMap::new();
-    map.insert(cval!(false), val!(2));
-    map.insert(cval!([-1]), val!(5));
-    map.insert(cval!(-1), val!(1));
-    map.insert(cval!(10), val!(0));
-    map.insert(cval!(100), val!(3));
-    map.insert(cval!([100]), val!(7));
-    map.insert(cval!("z"), val!(4));
-    map.insert(cval!("aa"), val!(6));
-
-    let mut bytes1 = Vec::new();
-    ciborium::ser::into_writer(&map, &mut bytes1).unwrap();
-
-    assert_eq!(
-        hex::encode(&bytes1),
-        "a80a002001f402186403617a048120056261610681186407"
-    );
-}
+//#[test]
+//fn map() {
+//    let mut map = BTreeMap::new();
+//    map.insert(cval!(false), val!(2));
+//    map.insert(cval!([-1]), val!(5));
+//    map.insert(cval!(-1), val!(1));
+//    map.insert(cval!(10), val!(0));
+//    map.insert(cval!(100), val!(3));
+//    map.insert(cval!([100]), val!(7));
+//    map.insert(cval!("z"), val!(4));
+//    map.insert(cval!("aa"), val!(6));
+//
+//    let mut bytes1 = Vec::new();
+//    ciborium::ser::into_writer(&map, &mut bytes1).unwrap();
+//
+//    assert_eq!(
+//        hex::encode(&bytes1),
+//        "a80a002001f402186403617a048120056261610681186407"
+//    );
+//}
 
 #[test]
 fn negative_numbers() {

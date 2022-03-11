@@ -10,7 +10,10 @@ use alloc::{string::String, vec::Vec};
 
 use ciborium_io::Read;
 use ciborium_ll::*;
+use cid::serde::CID_SERDE_PRIVATE_IDENTIFIER;
 use serde::{de, de::Deserializer as _, forward_to_deserialize_any};
+
+use crate::CBOR_TAGS_CID;
 
 trait Expected<E: de::Error> {
     fn expected(self, kind: &'static str) -> E;
@@ -175,6 +178,10 @@ where
                         }
                     }
 
+                    (CBOR_TAGS_CID, _) => {
+                        self.recurse(|me| visitor.visit_newtype_struct(&mut CidDeserializer(me)))
+                    }
+
                     _ => self.recurse(|me| {
                         let access = crate::tag::TagAccess::new(me, Some(tag));
                         visitor.visit_enum(access)
@@ -321,15 +328,21 @@ where
         loop {
             let offset = self.decoder.offset();
 
-            return match self.decoder.pull()? {
+            let header = self.decoder.pull()?;
+            return match header {
                 Header::Tag(..) => continue,
 
-                Header::Text(Some(len)) if len <= self.scratch.len() => {
-                    self.decoder.read_exact(&mut self.scratch[..len])?;
+                Header::Text(Some(len)) => {
+                    if len <= self.scratch.len() {
+                        self.decoder.read_exact(&mut self.scratch[..len])?;
 
-                    match core::str::from_utf8(&self.scratch[..len]) {
-                        Ok(s) => visitor.visit_str(s),
-                        Err(..) => Err(Error::Syntax(offset)),
+                        match core::str::from_utf8(&self.scratch[..len]) {
+                            Ok(s) => visitor.visit_str(s),
+                            Err(..) => Err(Error::Syntax(offset)),
+                        }
+                    } else {
+                        self.decoder.push(header);
+                        self.deserialize_string(visitor)
                     }
                 }
 
@@ -363,12 +376,18 @@ where
 
     fn deserialize_bytes<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         loop {
-            return match self.decoder.pull()? {
+            let header = self.decoder.pull()?;
+            return match header {
                 Header::Tag(..) => continue,
 
-                Header::Bytes(Some(len)) if len <= self.scratch.len() => {
-                    self.decoder.read_exact(&mut self.scratch[..len])?;
-                    visitor.visit_bytes(&self.scratch[..len])
+                Header::Bytes(Some(len)) => {
+                    if len <= self.scratch.len() {
+                        self.decoder.read_exact(&mut self.scratch[..len])?;
+                        visitor.visit_bytes(&self.scratch[..len])
+                    } else {
+                        self.decoder.push(header);
+                        self.deserialize_byte_buf(visitor)
+                    }
                 }
 
                 Header::Array(len) => self.recurse(|me| {
@@ -497,16 +516,14 @@ where
 
     #[inline]
     fn deserialize_option<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        loop {
-            return match self.decoder.pull()? {
-                Header::Simple(simple::UNDEFINED) => visitor.visit_none(),
-                Header::Simple(simple::NULL) => visitor.visit_none(),
-                Header::Tag(..) => continue,
-                header => {
-                    self.decoder.push(header);
-                    visitor.visit_some(self)
-                }
-            };
+        match self.decoder.pull()? {
+            Header::Simple(simple::UNDEFINED) => visitor.visit_none(),
+            Header::Simple(simple::NULL) => visitor.visit_none(),
+            // There might be a CID in the option, hence also decode if there's a tag.
+            header => {
+                self.decoder.push(header);
+                visitor.visit_some(self)
+            }
         }
     }
 
@@ -514,8 +531,8 @@ where
     fn deserialize_unit<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         loop {
             return match self.decoder.pull()? {
-                Header::Simple(simple::UNDEFINED) => visitor.visit_unit(),
-                Header::Simple(simple::NULL) => visitor.visit_unit(),
+                Header::Simple(simple::UNDEFINED) => visitor.visit_none(),
+                Header::Simple(simple::NULL) => visitor.visit_none(),
                 Header::Tag(..) => continue,
                 header => Err(header.expected("unit")),
             };
@@ -534,10 +551,20 @@ where
     #[inline]
     fn deserialize_newtype_struct<V: de::Visitor<'de>>(
         self,
-        _name: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        visitor.visit_newtype_struct(self)
+        if name == CID_SERDE_PRIVATE_IDENTIFIER {
+            match self.decoder.pull()? {
+                // It's only valid if there is really an encoded CID.
+                Header::Tag(CBOR_TAGS_CID) => {
+                    self.recurse(|me| visitor.visit_newtype_struct(&mut CidDeserializer(me)))
+                }
+                header => Err(header.expected("CID")),
+            }
+        } else {
+            visitor.visit_newtype_struct(self)
+        }
     }
 
     #[inline]
@@ -794,6 +821,81 @@ where
             1 => 1,
             _ => 0,
         })
+    }
+}
+
+/// Deserialize a DAG-CBOR encoded CID.
+///
+/// This is without the CBOR tag information. It is only the CBOR byte string identifier (major
+/// type 2), the number of bytes, and a null byte prefixed CID.
+///
+/// The reason for not including the CBOR tag information is the [`Value`] implementation. That one
+/// starts to parse the bytes, before we could interfere. If the data only includes a CID, we are
+/// parsing over the tag to determine whether it is a CID or not and go from there.
+struct CidDeserializer<'a, 'b, R: Read>(&'a mut Deserializer<'b, R>);
+
+impl<'de, 'a, 'b, R: Read> de::Deserializer<'de> for &'a mut CidDeserializer<'a, 'b, R>
+where
+    R::Error: core::fmt::Debug,
+{
+    type Error = Error<R::Error>;
+
+    fn deserialize_any<V: de::Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
+        Err(de::Error::custom(
+            "Only bytes can be deserialized into a CID",
+        ))
+    }
+
+    #[inline]
+    fn deserialize_bytes<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        let header = self.0.decoder.pull()?;
+
+        match header {
+            Header::Bytes(Some(len)) => {
+                // CBOR encoded CIDs have a null byte as prefix, hence they are at least one byte
+                // long.
+                if len <= 1 {
+                    Err(header.expected("CBOR encoded CID"))
+                } else if len <= self.0.scratch.len() {
+                    self.0.decoder.read_exact(&mut self.0.scratch[..len])?;
+                    // In DAG-CBOR the CID is prefixed with a null byte, strip that off.
+                    visitor.visit_bytes(&self.0.scratch[1..len])
+                } else {
+                    let mut buffer = Vec::new();
+                    let mut segments = self.0.decoder.bytes(Some(len));
+                    while let Some(mut segment) = segments.pull()? {
+                        while let Some(chunk) = segment.pull(self.0.scratch)? {
+                            buffer.extend_from_slice(chunk);
+                        }
+                    }
+                    // In DAG-CBOR the CID is prefixed with a null byte, strip that off. Won't
+                    // panic as we've checked the length to be at least 1 byte.
+                    buffer.remove(0);
+                    visitor.visit_byte_buf(buffer)
+                }
+            }
+            header => Err(header.expected("expected byte buffer")),
+        }
+    }
+
+    fn deserialize_newtype_struct<V: de::Visitor<'de>>(
+        self,
+        name: &str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        if name == CID_SERDE_PRIVATE_IDENTIFIER {
+            self.deserialize_bytes(visitor)
+        } else {
+            return Err(de::Error::custom(format!(
+                "This deserializer must not be called on newtype structs other than one named `{}`",
+                CID_SERDE_PRIVATE_IDENTIFIER
+            )));
+        }
+    }
+
+    forward_to_deserialize_any! {
+        bool byte_buf char enum f32 f64 i8 i16 i32 i64 identifier ignored_any map option seq str
+        string struct tuple tuple_struct u8 u16 u32 u64 unit unit_struct
     }
 }
 

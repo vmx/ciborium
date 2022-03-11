@@ -220,3 +220,6 @@ macro_rules! cbor {
         $crate::value::Value::serialized(&$val)
     }};
 }
+
+/// The CBOR tag that is used for CIDs.
+const CBOR_TAGS_CID: u64 = 42;
